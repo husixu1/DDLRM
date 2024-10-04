@@ -1,10 +1,17 @@
+import os
 import copy
+import time
+import random
 import inspect
+from typing import Any, Callable, Dict, Optional
 import torch
 from functools import partial
 from torch.fx.passes import graph_drawer
+from torch.fx import GraphModule
+from torch.utils.data import DataLoader
 from torch.profiler import profile, record_function, ProfilerActivity
 from concurrent.futures import ThreadPoolExecutor
+import torch.multiprocessing as mp
 import tracy_client as tracy
 
 
@@ -160,3 +167,111 @@ def draw_graph(gm, save_path):
     g = graph_drawer.FxGraphDrawer(gm, 'training')
     with open(save_path, "w") as f:
         f.write(g.get_main_dot_graph().__str__())
+
+
+def load_data(iteration):
+    print(f"it {iteration}: data loaded")
+    return iteration ** 2
+
+
+def calc_loss(iteration):
+    print(f"it {iteration}: loss calculated")
+
+
+class PPRuntime:
+    def __init__(
+            self, model: Optional[GraphModule] = None,
+            input_fn: Optional[Callable] = None,
+            output_fn: Optional[Callable] = None,
+            split_config: Optional[Dict[Any, int]] = None) -> None:
+        """
+        Args:
+            input_fn: function exectued at each step before the pipeline runs,
+                whose result will be fed into the model. Only stage 0 executes
+                this function.
+            output_fn: function executed at each sten after the model starts to
+                produce results, whose value will be returned by `step`. Only
+                the last stage executes this function.
+            split_cfg: Map nodes to workers
+
+        Note:
+            input_fn and args_fn must be defined in a submodule instead of
+            the main script. See https://stackoverflow.com/questions/41385708
+        """
+        mp.set_start_method("forkserver")
+
+        self.split_config = copy.deepcopy(split_config)
+        """How to split the compute graph"""
+
+        self.num_stages = (
+            1 if split_config is None else
+            len(set(split_config.values())))
+        """Numbero of stages == number of workers"""
+
+        self.prereq_data = {
+            i: mp.Manager().Queue() for i in range(1, self.num_stages)}
+        """Queues that stores data of the previous stage"""
+
+        self.step_sem = mp.Semaphore(0)
+        """Semaphore signaling that .step() called. Used by the process 0"""
+
+        self.input_fn = input_fn or (lambda x: print(f"Iter {x} Started"))
+        self.output_fn = output_fn or (lambda x: print(f"Iter {x} Finished"))
+
+        # Maybe start MP here since we need dynamic scaling
+        self.processes = mp.spawn(
+            self.worker_loop, args=(),
+            nprocs=self.num_stages, join=False)
+
+    def init_rank(self, rank):
+        # TODO: split graph module
+        pass
+
+    def worker_loop(self, rank: int):
+        """Each worker's own compute loop"""
+        self.init_rank(rank)
+
+        iteration = 0
+        while True:
+
+            # Obtain input
+            if rank == 0:
+                print(f"Step sem value is {self.step_sem.get_value()}")
+                self.step_sem.acquire()
+                data = self.input_fn(iteration)
+            else:
+                data = self.prereq_data[rank].get()
+
+            # Process input
+            with open(f"logs/{rank}.log", "a") as log:
+                log.write(
+                    f"rank {rank}: I'm {os.getpid()}, data is {data}\n")
+
+            time.sleep(1 + random.random())
+            data += 1
+
+            # Send/process output
+            if rank != self.num_stages - 1:
+                self.prereq_data[rank+1].put(data)
+            else:
+                self.output_fn(iteration)
+
+            iteration += 1
+
+    # Advance all pipeline
+    def step(self):
+        """
+        Step the pipeline, advance each stage in parallel.
+        Must be called separately by each process to step its corresponding worker
+        """
+        self.step_sem.release()
+
+    @staticmethod
+    def profile_guided_split(
+            model: GraphModule, data_loader: DataLoader, profile_result):
+        """
+        Generate split config given a profile_result
+        Returns:
+            a split_config
+        """
+        pass
