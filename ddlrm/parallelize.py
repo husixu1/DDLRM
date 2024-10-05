@@ -2,12 +2,14 @@ import os
 import copy
 import time
 import random
+import pickle
 import inspect
+import logging
 from typing import Any, Callable, Dict, Optional
 import torch
 from functools import partial
 from torch.fx.passes import graph_drawer
-from torch.fx import GraphModule
+from torch.fx import GraphModule, Node
 from torch.utils.data import DataLoader
 from torch.profiler import profile, record_function, ProfilerActivity
 from concurrent.futures import ThreadPoolExecutor
@@ -171,7 +173,7 @@ def draw_graph(gm, save_path):
 
 def load_data(iteration):
     print(f"it {iteration}: data loaded")
-    return iteration ** 2
+    return {'x_1': torch.tensor(iteration * 2.0)}
 
 
 def calc_loss(iteration):
@@ -180,7 +182,7 @@ def calc_loss(iteration):
 
 class PPRuntime:
     def __init__(
-            self, model: Optional[GraphModule] = None,
+            self, model: GraphModule,
             input_fn: Optional[Callable] = None,
             output_fn: Optional[Callable] = None,
             split_config: Optional[Dict[Any, int]] = None) -> None:
@@ -200,7 +202,10 @@ class PPRuntime:
         """
         mp.set_start_method("forkserver")
 
-        self.split_config = copy.deepcopy(split_config)
+        self.model = model
+
+        self.split_config = copy.copy(
+            split_config) if split_config else {'': 0}
         """How to split the compute graph"""
 
         self.num_stages = (
@@ -208,9 +213,17 @@ class PPRuntime:
             len(set(split_config.values())))
         """Numbero of stages == number of workers"""
 
+        # Check correctness of split config
+        assert set(split_config.values()) == set(range(self.num_stages))
+
+        # TODO: one stage can obtain prereq data from many previous stages
         self.prereq_data = {
-            i: mp.Manager().Queue() for i in range(1, self.num_stages)}
-        """Queues that stores data of the previous stage"""
+            recv: {send: mp.Manager().Queue() for send in range(recv)}
+            for recv in range(1, self.num_stages)}
+        """Queues that stores data of the previous stage (shared by processes)"""
+
+        self.dep_stages = set()
+        """From which stages this stage requires data"""
 
         self.step_sem = mp.Semaphore(0)
         """Semaphore signaling that .step() called. Used by the process 0"""
@@ -224,8 +237,62 @@ class PPRuntime:
             nprocs=self.num_stages, join=False)
 
     def init_rank(self, rank):
+        assert self.split_config is not None
+
         # TODO: split graph module
-        pass
+        gm = self.model
+
+        # {stage to send: {node name: value/tensor}}
+        outputs: Dict[int, Dict[str, Node]] = {}
+        # Stores a list of nodes to erase
+        nodes_to_erase = []
+        for node in self.model.graph.nodes:
+            if self.split_config[node.name] < rank:
+                # Remove nodes of previous stage
+                nodes_to_erase.append(node)
+            elif self.split_config[node.name] == rank:
+                # Modify inputs of nodes of this stage
+                for prev in node.all_input_nodes:
+                    # skip nodes in the same stage and already replaced ones
+                    if (prev.name.endswith("_rep") or
+                            self.split_config[prev.name] == rank):
+                        continue
+                    # replace input with prev stage output
+                    assert self.split_config[prev.name] <= rank
+                    if self.split_config[prev.name] < rank:
+                        with gm.graph.inserting_before(prev):
+                            self.dep_stages.add(self.split_config[prev.name])
+                            inp = gm.graph.placeholder(f"{prev.name}_rep")
+                            prev.replace_all_uses_with(inp)
+            else:
+                # replace nodes of next stages as outputs
+                for prev in node.all_input_nodes:
+                    # skip output of other stages
+                    if self.split_config[prev.name] != rank:
+                        continue
+                    # There's only one output. We need to combine the output of nodes
+                    this_node_stage = self.split_config[node.name]
+                    if not this_node_stage in outputs:
+                        outputs[this_node_stage] = {}
+                    if prev.name not in outputs[this_node_stage]:
+                        outputs[this_node_stage][f"{prev.name}_rep"] = prev
+                nodes_to_erase.append(node)
+                if node.op == 'output':
+                    if self.split_config[node.name] == rank:
+                        continue
+                    with gm.graph.inserting_before(node):
+                        gm.graph.output(outputs)
+
+        # Remove from tail to front
+        for node in nodes_to_erase[::-1]:
+            gm.graph.erase_node(node)
+
+        # Recompile the graph
+        gm.graph.lint()
+        gm.recompile()
+
+        # TODO: visualize
+        draw_graph(self.model, f"logs/rank{rank}.dot")
 
     def worker_loop(self, rank: int):
         """Each worker's own compute loop"""
@@ -233,26 +300,30 @@ class PPRuntime:
 
         iteration = 0
         while True:
-
             # Obtain input
             if rank == 0:
                 print(f"Step sem value is {self.step_sem.get_value()}")
                 self.step_sem.acquire()
                 data = self.input_fn(iteration)
             else:
-                data = self.prereq_data[rank].get()
+                # get from dependent stages and combine datas
+                data = {
+                    k: v for dep_stage in self.dep_stages
+                    for k, v in self.prereq_data[rank][dep_stage].get().items()
+                }
 
             # Process input
             with open(f"logs/{rank}.log", "a") as log:
-                log.write(
-                    f"rank {rank}: I'm {os.getpid()}, data is {data}\n")
+                log.write(f"r {rank} it {iteration}: data {data}\n")
 
+            output = self.model(**data)
             time.sleep(1 + random.random())
-            data += 1
+            # data += 1
 
             # Send/process output
             if rank != self.num_stages - 1:
-                self.prereq_data[rank+1].put(data)
+                for send_stage, values in output.items():
+                    self.prereq_data[send_stage][rank].put(values)
             else:
                 self.output_fn(iteration)
 
@@ -274,4 +345,7 @@ class PPRuntime:
         Returns:
             a split_config
         """
+        # Unforunately, node name changes when (un)pickling, thus we pickle it
+        # here to prevent name change on multiprocessing fork.
+        model = pickle.loads(pickle.dumps(model))
         pass
