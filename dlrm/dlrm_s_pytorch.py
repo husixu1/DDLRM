@@ -74,6 +74,11 @@ import dlrm_data_pytorch as dp
 import extend_distributed as ext_dist
 import mlperf_logger
 
+# [husixu] inserted code
+from parallelize import draw_graph, profiled, parallelize
+from functorch import make_fx
+import tracy_client as tracy
+
 # numpy
 import numpy as np
 import optim.rwsadagrad as RowWiseSparseAdagrad
@@ -120,6 +125,12 @@ with warnings.catch_warnings():
 exc = getattr(builtins, "IOError", "FileNotFoundError")
 
 
+def init_tracy():
+    assert tracy.program_name("MyApp")
+    assert tracy.app_info("this is a python app")
+    tracy.thread_name("python")
+
+
 def time_wrap(use_gpu):
     if use_gpu:
         torch.cuda.synchronize()
@@ -142,7 +153,7 @@ def dlrm_wrap(X, lS_o, lS_i, use_gpu, device, ndevices=1):
                     if isinstance(lS_o, list)
                     else lS_o.to(device)
                 )
-        return dlrm(X.to(device), lS_o, lS_i)
+        return dlrm_gm(X.to(device), lS_o, lS_i)
 
 
 def loss_fn_wrap(Z, T, use_gpu, device):
@@ -150,7 +161,8 @@ def loss_fn_wrap(Z, T, use_gpu, device):
         if args.loss_function == "mse" or args.loss_function == "bce":
             return dlrm.loss_fn(Z, T.to(device))
         elif args.loss_function == "wbce":
-            loss_ws_ = dlrm.loss_ws[T.data.view(-1).long()].view_as(T).to(device)
+            loss_ws_ = dlrm.loss_ws[T.data.view(-1).long()
+                                    ].view_as(T).to(device)
             loss_fn_ = dlrm.loss_fn(Z, T.to(device))
             loss_sc_ = loss_ws_ * loss_fn_
             return loss_sc_.mean()
@@ -182,13 +194,15 @@ class LRPolicyScheduler(_LRScheduler):
         step_count = self._step_count
         if step_count < self.num_warmup_steps:
             # warmup
-            scale = 1.0 - (self.num_warmup_steps - step_count) / self.num_warmup_steps
+            scale = 1.0 - (self.num_warmup_steps - step_count) / \
+                self.num_warmup_steps
             lr = [base_lr * scale for base_lr in self.base_lrs]
             self.last_lr = lr
         elif self.decay_start_step <= step_count and step_count < self.decay_end_step:
             # decay
             decayed_steps = step_count - self.decay_start_step
-            scale = ((self.num_decay_steps - decayed_steps) / self.num_decay_steps) ** 2
+            scale = ((self.num_decay_steps - decayed_steps) /
+                     self.num_decay_steps) ** 2
             min_lr = 0.0000001
             lr = [max(min_lr, base_lr * scale) for base_lr in self.base_lrs]
             self.last_lr = lr
@@ -363,11 +377,13 @@ class DLRM_Net(nn.Module):
                     n_emb
                 )
                 self.local_emb_slice = ext_dist.get_my_slice(n_emb)
-                self.local_emb_indices = list(range(n_emb))[self.local_emb_slice]
+                self.local_emb_indices = list(range(n_emb))[
+                    self.local_emb_slice]
 
             # create operators
             if ndevices <= 1:
-                self.emb_l, w_list = self.create_emb(m_spa, ln_emb, weighted_pooling)
+                self.emb_l, w_list = self.create_emb(
+                    m_spa, ln_emb, weighted_pooling)
                 if self.weighted_pooling == "learned":
                     self.v_W_l = nn.ParameterList()
                     for w in w_list:
@@ -424,13 +440,16 @@ class DLRM_Net(nn.Module):
             # E = emb_l[k]
 
             if v_W_l[k] is not None:
-                per_sample_weights = v_W_l[k].gather(0, sparse_index_group_batch)
+                per_sample_weights = v_W_l[k].gather(
+                    0, sparse_index_group_batch)
             else:
                 per_sample_weights = None
 
             if self.quantize_emb:
-                s1 = self.emb_l_q[k].element_size() * self.emb_l_q[k].nelement()
-                s2 = self.emb_l_q[k].element_size() * self.emb_l_q[k].nelement()
+                s1 = self.emb_l_q[k].element_size() * \
+                    self.emb_l_q[k].nelement()
+                s2 = self.emb_l_q[k].element_size() * \
+                    self.emb_l_q[k].nelement()
                 print("quantized emb sizes:", s1, s2)
 
                 if self.quantize_bits == 4:
@@ -500,8 +519,10 @@ class DLRM_Net(nn.Module):
             # li, lj = torch.tril_indices(ni, nj, offset=offset)
             # approach 2: custom
             offset = 1 if self.arch_interaction_itself else 0
-            li = torch.tensor([i for i in range(ni) for j in range(i + offset)])
-            lj = torch.tensor([j for i in range(nj) for j in range(i + offset)])
+            li = torch.tensor([i for i in range(ni)
+                              for j in range(i + offset)])
+            lj = torch.tensor([j for i in range(nj)
+                              for j in range(i + offset)])
             Zflat = Z[:, li, lj]
             # concatenate dense features and interactions
             R = torch.cat([x] + [Zflat], dim=1)
@@ -561,7 +582,8 @@ class DLRM_Net(nn.Module):
         # Therefore, matching the distribution of output of bottom mlp, so that both
         # could be used for subsequent interactions on each device.
         if len(self.emb_l) != len(ly):
-            sys.exit("ERROR: corrupted intermediate result in distributed_forward call")
+            sys.exit(
+                "ERROR: corrupted intermediate result in distributed_forward call")
 
         a2a_req = ext_dist.alltoall(ly, self.n_emb_per_rank)
 
@@ -581,7 +603,8 @@ class DLRM_Net(nn.Module):
 
         # clamp output if needed
         if 0.0 < self.loss_threshold and self.loss_threshold < 1.0:
-            z = torch.clamp(p, min=self.loss_threshold, max=(1.0 - self.loss_threshold))
+            z = torch.clamp(p, min=self.loss_threshold,
+                            max=(1.0 - self.loss_threshold))
         else:
             z = p
 
@@ -608,7 +631,8 @@ class DLRM_Net(nn.Module):
 
         # clamp output if needed
         if 0.0 < self.loss_threshold and self.loss_threshold < 1.0:
-            z = torch.clamp(p, min=self.loss_threshold, max=(1.0 - self.loss_threshold))
+            z = torch.clamp(p, min=self.loss_threshold,
+                            max=(1.0 - self.loss_threshold))
         else:
             z = p
 
@@ -657,7 +681,8 @@ class DLRM_Net(nn.Module):
         dense_x = scatter(dense_x, device_ids, dim=0)
         # distribute sparse features (model parallelism)
         if (len(self.emb_l) != len(lS_o)) or (len(self.emb_l) != len(lS_i)):
-            sys.exit("ERROR: corrupted model input detected in parallel_forward call")
+            sys.exit(
+                "ERROR: corrupted model input detected in parallel_forward call")
 
         t_list = []
         i_list = []
@@ -691,7 +716,8 @@ class DLRM_Net(nn.Module):
         # Therefore, matching the distribution of output of bottom mlp, so that both
         # could be used for subsequent interactions on each device.
         if len(self.emb_l) != len(ly):
-            sys.exit("ERROR: corrupted intermediate result in parallel_forward call")
+            sys.exit(
+                "ERROR: corrupted intermediate result in parallel_forward call")
 
         t_list = []
         for k, _ in enumerate(self.emb_l):
@@ -787,7 +813,8 @@ def inference(
 
         # Skip the batch if batch size not multiple of total ranks
         if ext_dist.my_size > 1 and X_test.size(0) % ext_dist.my_size != 0:
-            print("Warning: Skiping the batch %d with size %d" % (i, X_test.size(0)))
+            print("Warning: Skiping the batch %d with size %d" %
+                  (i, X_test.size(0)))
             continue
 
         # forward pass
@@ -820,7 +847,8 @@ def inference(
                 T_test = T_test.detach().cpu().numpy()  # numpy array
 
                 mbs_test = T_test.shape[0]  # = mini_batch_size except last
-                A_test = np.sum((np.round(S_test, 0) == T_test).astype(np.uint8))
+                A_test = np.sum(
+                    (np.round(S_test, 0) == T_test).astype(np.uint8))
 
                 test_accu += A_test
                 test_samp += mbs_test
@@ -913,12 +941,15 @@ def run():
         "--arch-embedding-size", type=dash_separated_ints, default="4-3-2"
     )
     # j will be replaced with the table number
-    parser.add_argument("--arch-mlp-bot", type=dash_separated_ints, default="4-3-2")
-    parser.add_argument("--arch-mlp-top", type=dash_separated_ints, default="4-2-1")
+    parser.add_argument(
+        "--arch-mlp-bot", type=dash_separated_ints, default="4-3-2")
+    parser.add_argument(
+        "--arch-mlp-top", type=dash_separated_ints, default="4-2-1")
     parser.add_argument(
         "--arch-interaction-op", type=str, choices=["dot", "cat"], default="dot"
     )
-    parser.add_argument("--arch-interaction-itself", action="store_true", default=False)
+    parser.add_argument("--arch-interaction-itself",
+                        action="store_true", default=False)
     parser.add_argument("--weighted-pooling", type=str, default=None)
     # embedding table options
     parser.add_argument("--md-flag", action="store_true", default=False)
@@ -931,7 +962,8 @@ def run():
     parser.add_argument("--qr-collisions", type=int, default=4)
     # activations and loss
     parser.add_argument("--activation-function", type=str, default="relu")
-    parser.add_argument("--loss-function", type=str, default="mse")  # or bce or wbce
+    parser.add_argument("--loss-function", type=str,
+                        default="mse")  # or bce or wbce
     parser.add_argument(
         "--loss-weights", type=dash_separated_floats, default="1.0-1.0"
     )  # for wbce
@@ -953,16 +985,22 @@ def run():
     parser.add_argument("--rand-data-max", type=float, default=1)
     parser.add_argument("--rand-data-mu", type=float, default=-1)
     parser.add_argument("--rand-data-sigma", type=float, default=1)
-    parser.add_argument("--data-trace-file", type=str, default="./input/dist_emb_j.log")
-    parser.add_argument("--data-set", type=str, default="kaggle")  # or terabyte
+    parser.add_argument("--data-trace-file", type=str,
+                        default="./input/dist_emb_j.log")
+    parser.add_argument("--data-set", type=str,
+                        default="kaggle")  # or terabyte
     parser.add_argument("--raw-data-file", type=str, default="")
     parser.add_argument("--processed-data-file", type=str, default="")
-    parser.add_argument("--data-randomize", type=str, default="total")  # or day or none
-    parser.add_argument("--data-trace-enable-padding", type=bool, default=False)
+    parser.add_argument("--data-randomize", type=str,
+                        default="total")  # or day or none
+    parser.add_argument("--data-trace-enable-padding",
+                        type=bool, default=False)
     parser.add_argument("--max-ind-range", type=int, default=-1)
-    parser.add_argument("--data-sub-sample-rate", type=float, default=0.0)  # in [0, 1]
+    parser.add_argument("--data-sub-sample-rate",
+                        type=float, default=0.0)  # in [0, 1]
     parser.add_argument("--num-indices-per-lookup", type=int, default=10)
-    parser.add_argument("--num-indices-per-lookup-fixed", type=bool, default=False)
+    parser.add_argument("--num-indices-per-lookup-fixed",
+                        type=bool, default=False)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--memory-map", action="store_true", default=False)
     # training
@@ -1000,11 +1038,15 @@ def run():
     parser.add_argument("--test-mini-batch-size", type=int, default=-1)
     parser.add_argument("--test-num-workers", type=int, default=-1)
     parser.add_argument("--print-time", action="store_true", default=False)
-    parser.add_argument("--print-wall-time", action="store_true", default=False)
+    parser.add_argument("--print-wall-time",
+                        action="store_true", default=False)
     parser.add_argument("--debug-mode", action="store_true", default=False)
-    parser.add_argument("--enable-profiling", action="store_true", default=False)
-    parser.add_argument("--plot-compute-graph", action="store_true", default=False)
-    parser.add_argument("--tensor-board-filename", type=str, default="run_kaggle_pt")
+    parser.add_argument("--enable-profiling",
+                        action="store_true", default=False)
+    parser.add_argument("--plot-compute-graph",
+                        action="store_true", default=False)
+    parser.add_argument("--tensor-board-filename",
+                        type=str, default="run_kaggle_pt")
     # store/load model
     parser.add_argument("--save-model", type=str, default="")
     parser.add_argument("--load-model", type=str, default="")
@@ -1014,8 +1056,10 @@ def run():
     parser.add_argument("--mlperf-acc-threshold", type=float, default=0.0)
     # stop at target AUC Terabyte (no subsampling) 0.8025
     parser.add_argument("--mlperf-auc-threshold", type=float, default=0.0)
-    parser.add_argument("--mlperf-bin-loader", action="store_true", default=False)
-    parser.add_argument("--mlperf-bin-shuffle", action="store_true", default=False)
+    parser.add_argument("--mlperf-bin-loader",
+                        action="store_true", default=False)
+    parser.add_argument("--mlperf-bin-shuffle",
+                        action="store_true", default=False)
     # mlperf gradient accumulation iterations
     parser.add_argument("--mlperf-grad-accum-iter", type=int, default=1)
     # LR policy
@@ -1037,16 +1081,19 @@ def run():
         )
 
     if args.mlperf_logging:
-        mlperf_logger.log_event(key=mlperf_logger.constants.CACHE_CLEAR, value=True)
+        mlperf_logger.log_event(
+            key=mlperf_logger.constants.CACHE_CLEAR, value=True)
         mlperf_logger.log_start(
             key=mlperf_logger.constants.INIT_START, log_all_ranks=True
         )
 
     if args.weighted_pooling is not None:
         if args.qr_flag:
-            sys.exit("ERROR: quotient remainder with weighted pooling is not supported")
+            sys.exit(
+                "ERROR: quotient remainder with weighted pooling is not supported")
         if args.md_flag:
-            sys.exit("ERROR: mixed dimensions with weighted pooling is not supported")
+            sys.exit(
+                "ERROR: mixed dimensions with weighted pooling is not supported")
     if args.quantize_emb_with_bit in [4, 8]:
         if args.qr_flag:
             sys.exit(
@@ -1105,7 +1152,8 @@ def run():
         mlperf_logger.barrier()
 
     if args.data_generation == "dataset":
-        train_data, train_ld, test_data, test_ld = dp.make_criteo_data_and_loaders(args)
+        train_data, train_ld, test_data, test_ld = dp.make_criteo_data_and_loaders(
+            args)
         table_feature_map = {idx: idx for idx in range(len(train_data.counts))}
         nbatches = args.num_batches if args.num_batches > 0 else len(train_ld)
         nbatches_test = len(test_ld)
@@ -1130,7 +1178,8 @@ def run():
             raise Exception("Internal libraries are not available.")
         NUM_BATCHES = 5000
         nbatches = args.num_batches if args.num_batches > 0 else NUM_BATCHES
-        train_ld, feature_to_num_embeddings = fbDataLoader(args.data_size, nbatches)
+        train_ld, feature_to_num_embeddings = fbDataLoader(
+            args.data_size, nbatches)
         ln_emb = np.array(list(feature_to_num_embeddings.values()))
         m_den = ln_bot[0]
     else:
@@ -1377,7 +1426,16 @@ def run():
             args.lr_num_decay_steps,
         )
 
-    ### main loop ###
+    # [husixu] make_fx code here
+    global dlrm_gm
+    dlrm_gm = make_fx(dlrm)
+    dlrm_gm = dlrm_wrap(*(next(iter(train_ld))[:3]), use_gpu, device, ndevices)
+    # dlrm_gm = parallelize(dlrm_gm)
+    # dlrm_gm = profiled(dlrm_gm)
+    draw_graph(dlrm_gm, "dlrm_rep.dot")
+    print("Replacement done")
+
+    ### main loop #############################################################
 
     # training or inference
     best_acc_test = 0
@@ -1417,7 +1475,8 @@ def run():
                 )
         else:
             # when targeting inference on CPU
-            ld_model = torch.load(args.load_model, map_location=torch.device("cpu"))
+            ld_model = torch.load(
+                args.load_model, map_location=torch.device("cpu"))
         dlrm.load_state_dict(ld_model["state_dict"])
         ld_j = ld_model["iter"]
         ld_k = ld_model["epoch"]
@@ -1456,7 +1515,8 @@ def run():
                 )
             )
         else:
-            print("Testing state: accuracy = {:3.3f} %".format(ld_acc_test * 100))
+            print("Testing state: accuracy = {:3.3f} %".format(
+                ld_acc_test * 100))
 
     if args.inference_only:
         # Currently only dynamic quantization with INT8 and FP16 weights are
@@ -1507,7 +1567,8 @@ def run():
         mlperf_logger.log_event(
             key="sgd_opt_learning_rate_decay_steps", value=args.lr_num_decay_steps
         )
-        mlperf_logger.log_event(key="sgd_opt_learning_rate_decay_poly_power", value=2)
+        mlperf_logger.log_event(
+            key="sgd_opt_learning_rate_decay_poly_power", value=2)
 
     tb_file = "./" + args.tensor_board_filename
     writer = SummaryWriter(tb_file)
@@ -1543,7 +1604,8 @@ def run():
 
                 for j, inputBatch in enumerate(train_ld):
                     if j == 0 and args.save_onnx:
-                        X_onnx, lS_o_onnx, lS_i_onnx, _, _, _ = unpack_batch(inputBatch)
+                        X_onnx, lS_o_onnx, lS_i_onnx, _, _, _ = unpack_batch(
+                            inputBatch)
 
                     if j < skip_upto_batch:
                         continue
@@ -1572,7 +1634,8 @@ def run():
                         )
                         continue
 
-                    mbs = T.shape[0]  # = args.mini_batch_size except maybe for last
+                    # = args.mini_batch_size except maybe for last
+                    mbs = T.shape[0]
 
                     # forward pass
                     Z = dlrm_wrap(
@@ -1689,7 +1752,8 @@ def run():
                         if args.mlperf_logging:
                             previous_iteration_time = None
                         print(
-                            "Testing at - {}/{} of epoch {},".format(j + 1, nbatches, k)
+                            "Testing at - {}/{} of epoch {},".format(
+                                j + 1, nbatches, k)
                         )
                         model_metrics_dict, is_best = inference(
                             args,
@@ -1771,7 +1835,8 @@ def run():
                     mlperf_logger.barrier()
                     mlperf_logger.log_end(
                         key=mlperf_logger.constants.BLOCK_STOP,
-                        metadata={mlperf_logger.constants.FIRST_EPOCH_NUM: (k + 1)},
+                        metadata={
+                            mlperf_logger.constants.FIRST_EPOCH_NUM: (k + 1)},
                     )
                 k += 1  # nepochs
             if args.mlperf_logging and best_auc_test <= args.mlperf_auc_threshold:
@@ -1804,7 +1869,8 @@ def run():
                 )
             )
         with open("dlrm_s_pytorch" + time_stamp + "_total.prof", "w") as prof_f:
-            prof_f.write(prof.key_averages().table(sort_by="self_cpu_time_total"))
+            prof_f.write(prof.key_averages().table(
+                sort_by="self_cpu_time_total"))
         prof.export_chrome_trace("dlrm_s_pytorch" + time_stamp + ".json")
         # print(prof.key_averages().table(sort_by="cpu_time_total"))
 
@@ -1881,7 +1947,8 @@ def run():
                 {"indices_" + str(i): {0: "batch_size"}} for i in range(len(lS_i_onnx))
             ]
         )
-        dynamic_axes = {"dense_x": {0: "batch_size"}, "pred": {0: "batch_size"}}
+        dynamic_axes = {"dense_x": {0: "batch_size"},
+                        "pred": {0: "batch_size"}}
         for do in do_inputs:
             dynamic_axes.update(do)
         for di in di_inputs:
@@ -1907,4 +1974,5 @@ def run():
 
 
 if __name__ == "__main__":
+    init_tracy()
     run()
