@@ -268,7 +268,8 @@ class PPRuntime:
                 # replace nodes of next stages as outputs
                 for prev in node.all_input_nodes:
                     # skip output of other stages
-                    if self.split_config[prev.name] != rank:
+                    if (prev.name.endswith("_rep") or
+                            self.split_config[prev.name] != rank):
                         continue
                     # There's only one output. We need to combine the output of nodes
                     this_node_stage = self.split_config[node.name]
@@ -281,13 +282,15 @@ class PPRuntime:
                     if self.split_config[node.name] == rank:
                         continue
                     with gm.graph.inserting_before(node):
-                        gm.graph.output(outputs)
+                        out = gm.graph.output(outputs)
+                        node.replace_all_uses_with(out)
 
         # Remove from tail to front
         for node in nodes_to_erase[::-1]:
             gm.graph.erase_node(node)
 
         # Recompile the graph
+        gm.graph.eliminate_dead_code()
         gm.graph.lint()
         gm.recompile()
 
