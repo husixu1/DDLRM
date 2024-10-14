@@ -1,0 +1,317 @@
+#pragma once
+
+#include <stdio.h>
+
+#define DPROFILE_PRINT_ERROR         @dprofile_print_error@
+#define DPROFILE_PRINT_WARN          @dprofile_print_warn@
+#define DPROFILE_PRINT_LOG           @dprofile_print_log@
+#define DPROFILE_PRINT_DEBUG         @dprofile_print_debug@
+#define DPROFILE_PRINT_WITH_COLOR    @dprofile_print_with_color@
+
+#define _DPROFILE_PRINT_DPROFILEITION(stream)                                                 \
+{                                                                                   \
+fprintf(stream, "\
+\033[33mfile:\033[0m       %s;\n\
+\033[33mfunction:\033[0m   %s;\n\
+\033[33mline:\033[0m       %d;\n", __FILE__, __PRETTY_FUNCTION__, __LINE__);\
+}
+
+#ifdef __GNUG__
+#include <cstdlib>
+#include <memory>
+#include <cxxabi.h>
+
+static __attribute__((unused)) std::string demangle(const char* name) {
+
+    int status = -4; // some arbitrary value to eliminate the compiler warning
+
+    // enable c++11 by passing the flag -std=c++11 to g++
+    std::unique_ptr<char, void(*)(void*)> res {
+        abi::__cxa_demangle(name, NULL, NULL, &status),
+        std::free
+    };
+
+    return (status==0) ? res.get() : name;
+}
+
+#else
+
+// does nothing if not g++
+static __attribute__((unused)) std::string demangle(const char* name) {
+    return name;
+}
+
+#endif
+
+/**************************** DPROFILE_ERROR ****************************/
+
+#if DPROFILE_PRINT_ERROR
+/*!
+ * \brief   print error message (internal-used)
+ */
+#define _DPROFILE_ERROR(...)                                         \
+{                                                               \
+if constexpr(DPROFILE_PRINT_WITH_COLOR)                              \
+    fprintf(stdout, "\033[101m\033[97m DPROFILE Error \033[0m ");    \
+else                                                            \
+    fprintf(stdout, "|-DPROFILE Error-| ");                          \
+fprintf(stdout, __VA_ARGS__);                                   \
+fprintf(stdout, "\n");                                          \
+}
+
+/*!
+ * \brief   print error message with class info (internal-used)
+ * \note    this macro should only be expanded within c++ class
+ */
+#define _DPROFILE_ERROR_C(...)                                   \
+{                                                           \
+if constexpr(DPROFILE_PRINT_WITH_COLOR)                          \
+    fprintf(stdout,                                         \
+        "\033[101m\033[97m DPROFILE Error \033[0m [%s @ %p]  ",  \
+        demangle(typeid(*this).name()).c_str(), this        \
+    );                                                      \
+else                                                        \
+    fprintf(stdout,                                         \
+        "|-DPROFILE Error-| [%s @ %p]  ",                        \
+        demangle(typeid(*this).name()).c_str(), this        \
+    );                                                      \
+fprintf(stdout, __VA_ARGS__);                               \
+fprintf(stdout, "\n");                                      \
+}
+
+/*!
+    * \brief   print error message, then fatally quit
+    */
+#define DPROFILE_ERROR(...)          \
+{                               \
+_DPROFILE_ERROR(__VA_ARGS__)         \
+fflush(0);                      \
+throw "SHUTDOWN BY DPROFILE ERROR";  \
+exit(1);                        \
+}
+
+/*!
+    * \brief   print error message with class info, then fatally quit
+    * \note    this macro should only be expanded within c++ class
+    */
+#define DPROFILE_ERROR_C(...)        \
+{                               \
+_DPROFILE_ERROR_C(__VA_ARGS__)       \
+fflush(0);                      \
+throw "SHUTDOWN BY DPROFILE ERROR";  \
+exit(1);                        \
+}
+
+/*!
+    * \brief   print error message with specific code position, then fatally quit
+    */
+#define DPROFILE_ERROR_DETAIL(...)   \
+{                               \
+_DPROFILE_ERROR(__VA_ARGS__)         \
+_DPROFILE_PRINT_DPROFILEITION(stderr)     \
+fflush(0);                      \
+throw "SHUTDOWN BY DPROFILE ERROR";  \
+exit(1);                        \
+}
+
+/*!
+    * \brief   print error message with class info and specific code position,
+    *          then fatally quit
+    */
+#define DPROFILE_ERROR_C_DETAIL(...) \
+{                               \
+_DPROFILE_ERROR_C(__VA_ARGS__)       \
+_DPROFILE_PRINT_DPROFILEITION(stderr)     \
+fflush(0);                      \
+throw "SHUTDOWN BY DPROFILE ERROR";  \
+exit(1);                        \
+}
+#else
+#define DPROFILE_ERROR(...)
+#define DPROFILE_ERROR_C(...)
+#define DPROFILE_ERROR_DETAIL(...)
+#define DPROFILE_ERROR_C_DETAIL(...)
+#endif
+
+/**************************** DPROFILE_WARN *******************************/
+
+#if DPROFILE_PRINT_WARN
+/*!
+    * \brief   print warn message
+    */
+#define DPROFILE_WARN(...)                                           \
+{                                                               \
+if constexpr(DPROFILE_PRINT_WITH_COLOR)                              \
+    fprintf(stdout, "\033[103m\033[97m DPROFILE Warn \033[0m ");     \
+else                                                            \
+    fprintf(stdout, "|-DPROFILE Warn-| ");                           \
+fprintf(stdout, __VA_ARGS__);                                   \
+fprintf(stdout, "\n");                                          \
+}
+
+/*!
+    * \brief   print warn message with class info
+    * \note    this macro should only be expanded within c++ class
+    */
+#define DPROFILE_WARN_C(...)                                     \
+{                                                           \
+if constexpr(DPROFILE_PRINT_WITH_COLOR)                          \
+    fprintf(stdout,                                         \
+        "\033[103m\033[97m DPROFILE Warn \033[0m [%s @ %p]  ",   \
+        demangle(typeid(*this).name()).c_str(), this        \
+    );                                                      \
+else                                                        \
+    fprintf(stdout,                                         \
+        "|-DPROFILE Warn-| [%s @ %p]  ",                         \
+        demangle(typeid(*this).name()).c_str(), this        \
+    );                                                      \
+fprintf(stdout, __VA_ARGS__);                               \
+fprintf(stdout, "\n");                                      \
+}
+
+/*!
+    * \brief   print warn message with class info and specific code position
+    */
+#define DPROFILE_WARN_DETAIL(...)    \
+{                               \
+DPROFILE_WARN(__VA_ARGS__)           \
+_DPROFILE_PRINT_DPROFILEITION(stderr)     \
+}
+
+/*!
+    * \brief   print warn message with class info and specific code position
+    * \note    this macro should only be expanded within c++ class
+    */
+#define DPROFILE_WARN_C_DETAIL(...)  \
+{                               \
+DPROFILE_WARN_C(__VA_ARGS__)         \
+_DPROFILE_PRINT_DPROFILEITION(stderr)     \
+}
+#else
+#define DPROFILE_WARN(...)
+#define DPROFILE_WARN_C(...)
+#define DPROFILE_WARN_DETAIL(...)
+#define DPROFILE_WARN_C_DETAIL(...)
+#endif
+
+/***************************** DPROFILE_LOG *****************************/
+
+#if DPROFILE_PRINT_LOG
+/*!
+    * \brief   print log message
+    */
+#define DPROFILE_LOG(...)                                        \
+{                                                           \
+if constexpr(DPROFILE_PRINT_WITH_COLOR)                          \
+    fprintf(stdout, "\033[104m\033[97m DPROFILE Log \033[0m ");  \
+else                                                        \
+    fprintf(stdout, "|-DPROFILE Log-| ");                        \
+fprintf(stdout, __VA_ARGS__);                               \
+fprintf(stdout, "\n");                                      \
+}
+
+/*!
+    * \brief   print log message with class info
+    * \note    this macro should only be expanded within c++ class
+    */
+#define DPROFILE_LOG_C(...)                                      \
+{                                                           \
+if constexpr(DPROFILE_PRINT_WITH_COLOR)                          \
+    fprintf(stdout,                                         \
+        "\033[104m\033[97m DPROFILE Log \033[0m [%s @ %p]  ",    \
+        demangle(typeid(*this).name()).c_str(), this        \
+    );                                                      \
+else                                                        \
+    fprintf(stdout,                                         \
+        "|-DPROFILE Log-| [%s @ %p]  ",                          \
+        demangle(typeid(*this).name()).c_str(), this        \
+    );                                                      \
+fprintf(stdout, __VA_ARGS__);                               \
+fprintf(stdout, "\n");                                      \
+}
+
+/*!
+    * \brief   print log message with class info and specific code position
+    */
+#define DPROFILE_LOG_DETAIL(...)     \
+{                               \
+DPROFILE_LOG(__VA_ARGS__)            \
+_DPROFILE_PRINT_DPROFILEITION(stdout)     \
+}
+
+/*!
+    * \brief   print log message with class info and specific code position
+    * \note    this macro should only be expanded within c++ class
+    */
+#define DPROFILE_LOG_C_DETAIL(...)   \
+{                               \
+DPROFILE_LOG_C(__VA_ARGS__)          \
+_DPROFILE_PRINT_DPROFILEITION(stdout)     \
+}
+#else
+#define DPROFILE_LOG(...)
+#define DPROFILE_LOG_C(...)
+#define DPROFILE_LOG_DETAIL(...)
+#define DPROFILE_LOG_C_DETAIL(...)
+#endif
+
+/**************************** DPROFILE_DEBUG ****************************/
+
+#if DPROFILE_PRINT_DEBUG
+/*!
+    * \brief   print debug message
+    */
+#define DPROFILE_DEBUG(...)                                          \
+{                                                               \
+if constexpr(DPROFILE_PRINT_WITH_COLOR)                              \
+    fprintf(stdout, "\033[104m\033[42m DPROFILE Debug \033[0m ");    \
+else                                                            \
+    fprintf(stdout, "|-DPROFILE Debug-| ");                          \
+fprintf(stdout, __VA_ARGS__);                                   \
+fprintf(stdout, "\n");                                          \
+}
+
+/*!
+    * \brief   print debug message with class info
+    * \note    this macro should only be expanded within c++ class
+    */
+#define DPROFILE_DEBUG_C(...)                                    \
+{                                                           \
+if constexpr(DPROFILE_PRINT_WITH_COLOR)                          \
+    fprintf(stdout,                                         \
+        "\033[104m\033[42m DPROFILE Debug \033[0m [%s @ %p]  ",  \
+        demangle(typeid(*this).name()).c_str(), this        \
+    );                                                      \
+else                                                        \
+    fprintf(stdout,                                         \
+        "|-DPROFILE Debug-| [%s @ %p]  ",                        \
+        demangle(typeid(*this).name()).c_str(), this        \
+    );                                                      \
+fprintf(stdout, __VA_ARGS__);                               \
+fprintf(stdout, "\n");                                      \
+}
+
+/*!
+    * \brief   print debug message with class info and specific code position
+    */
+#define DPROFILE_DEBUG_DETAIL(...)   \
+{                               \
+DPROFILE_DEBUG(__VA_ARGS__)          \
+_DPROFILE_PRINT_DPROFILEITION(stdout)     \
+}
+
+/*!
+    * \brief   print debug message with class info and specific code position
+    * \note    this macro should only be expanded within c++ class
+    */
+#define DPROFILE_DEBUG_C_DETAIL(...) \
+{                               \
+DPROFILE_DEBUG_C(__VA_ARGS__)        \
+_DPROFILE_PRINT_DPROFILEITION(stdout)     \
+}
+#else
+#define DPROFILE_DEBUG(...)
+#define DPROFILE_DEBUG_C(...)
+#define DPROFILE_DEBUG_DETAIL(...)
+#define DPROFILE_DEBUG_C_DETAIL(...)
+#endif
