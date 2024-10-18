@@ -75,7 +75,8 @@ import extend_distributed as ext_dist
 import mlperf_logger
 
 # [husixu] inserted code
-from parallelize import draw_graph, profiled, parallelize
+from parallelize import draw_graph, profiled, parallelize, PPRuntime
+import torch.multiprocessing as mp
 from functorch import make_fx
 import tracy_client as tracy
 
@@ -177,6 +178,12 @@ def unpack_batch(b):
         # Experiment with unweighted samples
         return b[0], b[1], b[2], b[3], torch.ones(b[3].size()), None
 
+def unpack_batch_pure(args, b):
+    if args.data_generation == "internal":
+        return fbInputBatchFormatter(b, args.data_size)
+    else:
+        # Experiment with unweighted samples
+        return b[0], b[1], b[2], b[3], torch.ones(b[3].size()), None
 
 class LRPolicyScheduler(_LRScheduler):
     def __init__(self, optimizer, num_warmup_steps, decay_start_step, num_decay_steps):
@@ -930,6 +937,136 @@ def inference(
     return model_metrics_dict, is_best
 
 
+class input_fn:
+    def __init__(self, args, use_gpu, device, ndevices):
+        self.use_gpu = use_gpu
+        self.device = device
+        self.ndevices = ndevices
+        self.args = args
+        self.loader_iter = None
+
+    def init_loader(self):
+        ln_emb = np.fromstring(self.args.arch_embedding_size, dtype=int, sep="-")
+        ln_bot = np.fromstring(self.args.arch_mlp_bot, dtype=int, sep="-")
+        m_den = ln_bot[0]
+        _, _, _, test_ld = dp.make_random_data_and_loader(self.args, ln_emb, m_den)
+        self.loader_iter = iter(test_ld)
+
+    def __call__(self, iteration):
+        if self.loader_iter is None:
+            self.init_loader()
+
+        try:
+            testBatch = next(self.loader_iter)
+        except StopIteration:
+            self.init_loader()
+            testBatch = next(self.loader_iter)
+
+        X, lS_o, lS_i, T_test, W_test, CBPP_test = unpack_batch_pure(
+                self.args, testBatch)
+        if self.use_gpu:  # .cuda()
+            # lS_i can be either a list of tensors or a stacked tensor.
+            # Handle each case below:
+            if self.ndevices == 1:
+                lS_i = (
+                    [S_i.to(self.device) for S_i in lS_i]
+                    if isinstance(lS_i, list)
+                    else lS_i.to(self.device)
+                )
+                lS_o = (
+                    [S_o.to(self.device) for S_o in lS_o]
+                    if isinstance(lS_o, list)
+                    else lS_o.to(self.device)
+                )
+        return X.to(self.device), lS_o, lS_i
+
+
+class output_fn:
+    def __init__(self, args):
+        self.args = args
+        self.test_accu = 0
+        self.test_samp = 0
+        if args.mlperf_logging:
+            self.scores = []
+            self.targets = []
+        self.loader_iter = None
+
+    def init_loader(self):
+        ln_emb = np.fromstring(self.args.arch_embedding_size, dtype=int, sep="-")
+        ln_bot = np.fromstring(self.args.arch_mlp_bot, dtype=int, sep="-")
+        m_den = ln_bot[0]
+        _, _, _, test_ld = dp.make_random_data_and_loader(self.args, ln_emb, m_den)
+        self.loader_iter = iter(test_ld)
+
+    def __call__(self, iteration, Z_test):
+        if self.loader_iter is None:
+            self.init_loader()
+
+        try:
+            testBatch = next(self.loader_iter)
+        except StopIteration:
+            self.init_loader()
+            testBatch = next(self.loader_iter)
+
+        X, lS_o, lS_i, T_test, W_test, CBPP_test = unpack_batch_pure(
+                self.args, testBatch)
+        ### gather the distributed results on each rank ###
+        # For some reason it requires explicit sync before all_gather call if
+        # tensor is on GPU memory
+        if Z_test.is_cuda:
+            torch.cuda.synchronize()
+        (_, batch_split_lengths) = ext_dist.get_split_lengths(X.size(0))
+        if ext_dist.my_size > 1:
+            Z_test = ext_dist.all_gather(Z_test, batch_split_lengths)
+
+        if self.args.mlperf_logging:
+            S_test = Z_test.detach().cpu().numpy()  # numpy array
+            T_test = T_test.detach().cpu().numpy()  # numpy array
+            self.scores.append(S_test)
+            self.targets.append(T_test)
+        else:
+            with record_function("DLRM accuracy compute"):
+                # compute loss and accuracy
+                S_test = Z_test.detach().cpu().numpy()  # numpy array
+                T_test = T_test.detach().cpu().numpy()  # numpy array
+
+                mbs_test = T_test.shape[0]  # = mini_batch_size except last
+                A_test = np.sum(
+                    (np.round(S_test, 0) == T_test).astype(np.uint8))
+
+                self.test_accu += A_test
+                self.test_samp += mbs_test
+
+
+# Pipelined parallel version of inference
+def inference_pp(
+    args,
+    dlrm,
+    best_acc_test,
+    best_auc_test,
+    test_ld,
+    device,
+    use_gpu,
+    ndevices,
+    log_iter=-1
+):
+
+    split_config = PPRuntime.profile_guided_split(dlrm_gm, None, None)
+
+    runtime = PPRuntime(
+        dlrm_gm,
+        input_fn(args, use_gpu, device, ndevices),
+        output_fn(args),
+        split_config)
+
+    k = 0
+    while k < args.nepochs: # DEBUG: just for test. Inference doesn't need epochs
+        for i, testBatch in enumerate(test_ld):
+            runtime.step()
+        k +=1
+    runtime.join_all()
+
+
 def run():
     ### parse arguments ###
     parser = argparse.ArgumentParser(
@@ -1432,7 +1569,8 @@ def run():
     dlrm_gm = dlrm_wrap(*(next(iter(train_ld))[:3]), use_gpu, device, ndevices)
     # dlrm_gm = parallelize(dlrm_gm)
     # dlrm_gm = profiled(dlrm_gm)
-    draw_graph(dlrm_gm, "dlrm_rep.dot")
+    draw_graph(dlrm_gm, "dlrm.dot")
+    # print(dlrm_gm)
     print("Replacement done")
 
     ### main loop #############################################################
@@ -1849,7 +1987,7 @@ def run():
                 )
         else:
             print("Testing for inference only")
-            inference(
+            inference_pp(
                 args,
                 dlrm,
                 best_acc_test,
@@ -1857,6 +1995,7 @@ def run():
                 test_ld,
                 device,
                 use_gpu,
+                ndevices,
             )
 
     # profiling

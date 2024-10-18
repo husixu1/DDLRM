@@ -1,10 +1,12 @@
 import os
+import json
 import copy
 import time
 import random
 import pickle
 import inspect
 import logging
+from types import NoneType
 from typing import Any, Callable, Dict, Optional
 import torch
 from functools import partial
@@ -176,15 +178,15 @@ def load_data(iteration):
     return {'x_1': torch.tensor(iteration * 2.0)}
 
 
-def calc_loss(iteration):
-    print(f"it {iteration}: loss calculated")
+def calc_loss(iteration, data):
+    print(f"it {iteration}: data received {data}")
 
 
 class PPRuntime:
     def __init__(
             self, model: GraphModule,
-            input_fn: Optional[Callable] = None,
-            output_fn: Optional[Callable] = None,
+            input_fn: Callable[[int], Any] = (lambda x: x),
+            output_fn: Callable[[int, Any], NoneType] = (lambda _, __: None),
             split_config: Optional[Dict[Any, int]] = None) -> None:
         """
         Args:
@@ -319,16 +321,19 @@ class PPRuntime:
             with open(f"logs/{rank}.log", "a") as log:
                 log.write(f"r {rank} it {iteration}: data {data}\n")
 
-            output = self.model(**data)
+            with torch.no_grad():
+                output = self.model(*data) if rank == 0 else self.model(**data)
+
             time.sleep(1 + random.random())
             # data += 1
 
             # Send/process output
             if rank != self.num_stages - 1:
                 for send_stage, values in output.items():
-                    self.prereq_data[send_stage][rank].put(values)
+                    with torch.no_grad():
+                        self.prereq_data[send_stage][rank].put(values)
             else:
-                self.output_fn(iteration)
+                self.output_fn(iteration, output)
 
             iteration += 1
 
@@ -339,6 +344,9 @@ class PPRuntime:
         Must be called separately by each process to step its corresponding worker
         """
         self.step_sem.release()
+
+    def join_all(self):
+        self.processes.join()
 
     @staticmethod
     def profile_guided_split(
@@ -351,4 +359,8 @@ class PPRuntime:
         # Unforunately, node name changes when (un)pickling, thus we pickle it
         # here to prevent name change on multiprocessing fork.
         model = pickle.loads(pickle.dumps(model))
-        pass
+        print(model)
+        draw_graph(model, "pickled.dot")
+        with open('./manual.json') as f:
+            split_config = json.load(f)
+        return split_config
