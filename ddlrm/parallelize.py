@@ -125,6 +125,47 @@ def profiled(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
     return new_gm
 
 
+def mp_profiled(gm: torch.fx.GraphModule, cli: tracy.MpClient) -> torch.fx.GraphModule:
+    # new_gm = copy.deepcopy(gm)
+    new_gm = gm
+
+    def wrapped(fn, i):
+        name = f"{fn.__name__}:{i}"
+        mp_client = cli
+        # if name not in plotted:
+        #     plotted[name] = tracy.plot_config(
+        #         name, tracy.PlotFormatType.Number, True)
+
+        def with_wrap(*args, **kwargs):
+            with cli.ScopedZone(name=name) as zone:
+                # tracy.plot(plotted[name], 1)
+                with profile(
+                        activities=[ProfilerActivity.CPU,
+                                    ProfilerActivity.CUDA],
+                        profile_memory=True, record_shapes=True) as prof:
+                    result = fn(*args, **kwargs)
+                # tracy.plot(plotted[name], 0)
+                total = prof.key_averages().total_average()
+                zone.text(f"cpu-time: {total.self_cpu_time_total}")
+                zone.text(f"cpu-mmry: {total.self_cpu_memory_usage}")
+                zone.text(f"dev-time: {total.self_device_time_total}")
+                zone.text(f"dev-mmry: {total.self_device_memory_usage}")
+            return result
+        return with_wrap
+
+    for i, node in enumerate(new_gm.graph.nodes):
+        if node.op == 'call_function':
+            with new_gm.graph.inserting_before(node):
+                new_node = new_gm.graph.call_function(
+                    wrapped(node.target, i), args=node.args, kwargs=node.kwargs)
+                node.replace_all_uses_with(new_node)
+                new_gm.graph.erase_node(node)
+
+    new_gm.graph.lint()
+    new_gm.recompile()
+    return new_gm
+
+
 def parallelize(gm: torch.fx.GraphModule, topo=None, profile=None) -> torch.fx.GraphModule:
     # new_gm = copy.deepcopy(gm)
     new_gm = gm  # Directly modify the original gm
@@ -233,6 +274,8 @@ class PPRuntime:
         self.input_fn = input_fn or (lambda x: print(f"Iter {x} Started"))
         self.output_fn = output_fn or (lambda x: print(f"Iter {x} Finished"))
 
+        self.profile_cli: tracy.MpClient
+
         # Maybe start MP here since we need dynamic scaling
         self.processes = mp.spawn(
             self.worker_loop, args=(),
@@ -296,6 +339,10 @@ class PPRuntime:
         gm.graph.lint()
         gm.recompile()
 
+        # Add profiling function
+        self.profile_cli = tracy.MpClient(8900, rank)
+        self.model = mp_profiled(gm, self.profile_cli)
+
         # TODO: visualize
         draw_graph(self.model, f"logs/rank{rank}.dot")
 
@@ -309,13 +356,15 @@ class PPRuntime:
             if rank == 0:
                 print(f"Step sem value is {self.step_sem.get_value()}")
                 self.step_sem.acquire()
-                data = self.input_fn(iteration)
+                with self.profile_cli.ScopedZone("load-data") as zone:
+                    data = self.input_fn(iteration)
             else:
                 # get from dependent stages and combine datas
-                data = {
-                    k: v for dep_stage in self.dep_stages
-                    for k, v in self.prereq_data[rank][dep_stage].get().items()
-                }
+                with self.profile_cli.ScopedZone("recv") as zone:
+                    data = {
+                        k: v for dep_stage in self.dep_stages
+                        for k, v in self.prereq_data[rank][dep_stage].get().items()
+                    }
 
             # Process input
             with open(f"logs/{rank}.log", "a") as log:
@@ -324,16 +373,15 @@ class PPRuntime:
             with torch.no_grad():
                 output = self.model(*data) if rank == 0 else self.model(**data)
 
-            time.sleep(1 + random.random())
-            # data += 1
-
             # Send/process output
             if rank != self.num_stages - 1:
-                for send_stage, values in output.items():
-                    with torch.no_grad():
-                        self.prereq_data[send_stage][rank].put(values)
+                with self.profile_cli.ScopedZone("send") as zone:
+                    for send_stage, values in output.items():
+                        with torch.no_grad():
+                            self.prereq_data[send_stage][rank].put(values)
             else:
-                self.output_fn(iteration, output)
+                with self.profile_cli.ScopedZone("process-output") as zone:
+                    self.output_fn(iteration, output)
 
             iteration += 1
 
