@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 import os
 import json
 import copy
@@ -7,7 +8,7 @@ import pickle
 import inspect
 import logging
 from types import NoneType
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 import torch
 from functools import partial
 from torch.fx.passes import graph_drawer
@@ -16,6 +17,7 @@ from torch.utils.data import DataLoader
 from torch.profiler import profile, record_function, ProfilerActivity
 from concurrent.futures import ThreadPoolExecutor
 import torch.multiprocessing as mp
+import torch.distributed as dist
 import tracy_client as tracy
 
 
@@ -228,7 +230,9 @@ class PPRuntime:
             self, model: GraphModule,
             input_fn: Callable[[int], Any] = (lambda x: x),
             output_fn: Callable[[int, Any], NoneType] = (lambda _, __: None),
-            split_config: Optional[Dict[Any, int]] = None) -> None:
+            split_config: Optional[Dict[Any, int]] = None,
+            device_config: Optional[List[List[int]]] = None,
+            backend='nccl', do_profile: bool = False) -> None:
         """
         Args:
             input_fn: function exectued at each step before the pipeline runs,
@@ -251,6 +255,9 @@ class PPRuntime:
             split_config) if split_config else {'': 0}
         """How to split the compute graph"""
 
+        self.device_config = copy.copy(device_config)
+        """rank -> [assigned devices]"""
+
         self.num_stages = (
             1 if split_config is None else
             len(set(split_config.values())))
@@ -259,11 +266,16 @@ class PPRuntime:
         # Check correctness of split config
         assert set(split_config.values()) == set(range(self.num_stages))
 
-        # TODO: one stage can obtain prereq data from many previous stages
+        # one stage can obtain prereq data from many previous stages
         self.prereq_data = {
             recv: {send: mp.Manager().Queue() for send in range(recv)}
             for recv in range(1, self.num_stages)}
         """Queues that stores data of the previous stage (shared by processes)"""
+
+        self.backend = backend
+        """Communication backend"""
+
+        self.profiled = do_profile
 
         self.dep_stages = set()
         """From which stages this stage requires data"""
@@ -280,6 +292,16 @@ class PPRuntime:
         self.processes = mp.spawn(
             self.worker_loop, args=(),
             nprocs=self.num_stages, join=False)
+
+    def init_dist_backend(self, rank):
+        if self.backend != 'nccl':
+            return
+        # Initialize distributed backend
+        assert dist.is_nccl_available(), "NCCL is not available"
+        os.environ['MASTER_ADDR'] = '127.0.0.1'
+        os.environ['MASTER_PORT'] = '29500'
+        dist.init_process_group(
+            backend='nccl', rank=rank, world_size=self.num_stages)
 
     def init_rank(self, rank):
         assert self.split_config is not None
@@ -340,14 +362,74 @@ class PPRuntime:
         gm.recompile()
 
         # Add profiling function
-        self.profile_cli = tracy.MpClient(8900, rank)
-        self.model = mp_profiled(gm, self.profile_cli)
+        if self.profiled:
+            self.profile_cli = tracy.MpClient(8900, rank)
+            self.model = mp_profiled(gm, self.profile_cli)
 
         # TODO: visualize
         draw_graph(self.model, f"logs/rank{rank}.dot")
 
+    def recv_data(self, rank):
+        if self.backend == 'nccl':
+            devices = self.device_config[rank]
+            # First receive metadata via shared queue to get corrent input tensor shape and device
+            data_desc = {
+                stage: dict(self.prereq_data[rank][stage].get().items())
+                for stage in sorted(self.dep_stages)
+            }
+            # then construct the tensors and receive true data via nccl
+            data = dict()
+            print(data)
+            for dep_stage in sorted(self.dep_stages):
+                for k, (tag, shape) in data_desc[dep_stage].items():
+                    if tag == 'T':
+                        data[k] = torch.empty(shape).to(f"cuda:{devices[0]}")
+                        dist.recv(data[k], dep_stage)
+                    elif tag == 'L':
+                        data[k] = list(
+                            torch.empty(s).to(f"cuda:{devices[0]}")
+                            for s in shape)
+                        for i in range(len(shape)):
+                            dist.recv(data[k][i], dep_stage)
+                    else:
+                        raise RuntimeError("Unsupported data type")
+            return data
+        else:
+            return {
+                k: v for dep_stage in self.dep_stages
+                for k, v in self.prereq_data[rank][dep_stage].get().items()
+            }
+
+    def send_data(self, rank, output):
+        if self.backend == 'nccl':
+            for send_stage, values in sorted(output.items()):
+                data_desc = {k: tuple() for k in values.keys()}
+                send_list = []
+                # Compute metadata. We assume everything is (tuple of) tensor
+                for k, v in values.items():
+                    if isinstance(v, torch.Tensor):
+                        data_desc[k] = ('T', list(v.shape))
+                        send_list.append(v)
+                    elif isinstance(v, list):
+                        assert all(isinstance(vv, torch.Tensor) for vv in v)
+                        data_desc[k] = ('L', [list(vv.shape) for vv in v])
+                        send_list.extend(vv for vv in v)
+                    else:
+                        raise RuntimeError(f"Unsupported data type {v}")
+                # Send metadata first
+                with torch.no_grad():
+                    self.prereq_data[send_stage][rank].put(data_desc)
+                # Then send all tensors
+                for tensor in send_list:
+                    dist.send(tensor, send_stage)
+        else:
+            for send_stage, values in sorted(output.items()):
+                with torch.no_grad():
+                    self.prereq_data[send_stage][rank].put(values)
+
     def worker_loop(self, rank: int):
         """Each worker's own compute loop"""
+        self.init_dist_backend(rank)
         self.init_rank(rank)
 
         iteration = 0
@@ -356,15 +438,12 @@ class PPRuntime:
             if rank == 0:
                 print(f"Step sem value is {self.step_sem.get_value()}")
                 self.step_sem.acquire()
-                with self.profile_cli.ScopedZone("load-data") as zone:
+                with self.profile_cli.ScopedZone("load-data") if self.profiled else nullcontext() as zone:
                     data = self.input_fn(iteration)
             else:
                 # get from dependent stages and combine datas
-                with self.profile_cli.ScopedZone("recv") as zone:
-                    data = {
-                        k: v for dep_stage in self.dep_stages
-                        for k, v in self.prereq_data[rank][dep_stage].get().items()
-                    }
+                with self.profile_cli.ScopedZone("recv") if self.profiled else nullcontext() as zone:
+                    data = self.recv_data(rank)
 
             # Process input
             with open(f"logs/{rank}.log", "a") as log:
@@ -375,12 +454,10 @@ class PPRuntime:
 
             # Send/process output
             if rank != self.num_stages - 1:
-                with self.profile_cli.ScopedZone("send") as zone:
-                    for send_stage, values in output.items():
-                        with torch.no_grad():
-                            self.prereq_data[send_stage][rank].put(values)
+                with self.profile_cli.ScopedZone("send") if self.profiled else nullcontext() as zone:
+                    self.send_data(rank, output)
             else:
-                with self.profile_cli.ScopedZone("process-output") as zone:
+                with self.profile_cli.ScopedZone("process-output") if self.profiled else nullcontext() as zone:
                     self.output_fn(iteration, output)
 
             iteration += 1

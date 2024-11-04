@@ -859,7 +859,11 @@ def inference_pp(
         dlrm_gm,
         input_fn(args, use_gpu, device, ndevices),
         output_fn(args),
-        split_config)
+        split_config=split_config,
+        backend='cpu'
+        # device_config=[[0]] * 6,
+        # backend='nccl' if args.use_gpu else 'cpu'
+    )
 
     k = 0
     while k < args.nepochs: # DEBUG: just for test. Inference doesn't need epochs

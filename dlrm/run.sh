@@ -39,6 +39,6 @@ case "$1" in
         --inference-only
     ;;
 "random") python dlrm_s_pytorch.py --mini-batch-size=1 --data-size=1 --nepochs=100 --arch-interaction-op=dot --learning-rate=0.1 --inference-only ;;
-"random-pp") python dlrm_pp_inference.py --mini-batch-size=1 --data-size=1 --nepochs=100 --arch-interaction-op=dot --learning-rate=0.1 --inference-only ;;
+"random-pp") python dlrm_pp_inference.py --mini-batch-size=1 --data-size=1 --nepochs=100 --arch-interaction-op=dot --learning-rate=0.1 --inference-only --use-gpu ;;
 *) echo "Usage: $0 {kaggle|kaggle-pp|random|random-pp}" >&2 && exit 1 ;;
 esac
