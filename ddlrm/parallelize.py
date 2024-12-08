@@ -1,4 +1,5 @@
 from contextlib import nullcontext
+from dataclasses import dataclass
 import os
 import json
 import copy
@@ -218,7 +219,7 @@ def draw_graph(gm, save_path):
 
 def load_data(iteration):
     print(f"it {iteration}: data loaded")
-    return {'x_1': torch.tensor(iteration * 2.0)}
+    return [torch.tensor(iteration * 2.0).cuda()]
 
 
 def calc_loss(iteration, data):
@@ -226,12 +227,13 @@ def calc_loss(iteration, data):
 
 
 class PPRuntime:
+
     def __init__(
             self, model: GraphModule,
             input_fn: Callable[[int], Any] = (lambda x: x),
             output_fn: Callable[[int, Any], NoneType] = (lambda _, __: None),
-            split_config: Optional[Dict[Any, int]] = None,
-            device_config: Optional[List[List[int]]] = None,
+            split_config: Dict[Any, int] = [],
+            device_config: List[List[int]] = [],
             backend='nccl', do_profile: bool = False) -> None:
         """
         Args:
@@ -255,8 +257,9 @@ class PPRuntime:
             split_config) if split_config else {'': 0}
         """How to split the compute graph"""
 
-        self.device_config = copy.copy(device_config)
-        """rank -> [assigned devices]"""
+        self.device_config = mp.Manager().list(
+            [{gpu_idx: "" for gpu_idx in config} for config in device_config])
+        """{rank: {device: device uuid}}"""
 
         self.num_stages = (
             1 if split_config is None else
@@ -267,8 +270,10 @@ class PPRuntime:
         assert set(split_config.values()) == set(range(self.num_stages))
 
         # one stage can obtain prereq data from many previous stages
+        # Caution: cannot use Mp.Manager().Queue(). See
+        # https://discuss.pytorch.org/t/28023
         self.prereq_data = {
-            recv: {send: mp.Manager().Queue() for send in range(recv)}
+            recv: {send: mp.Queue() for send in range(recv)}
             for recv in range(1, self.num_stages)}
         """Queues that stores data of the previous stage (shared by processes)"""
 
@@ -279,6 +284,14 @@ class PPRuntime:
 
         self.dep_stages = set()
         """From which stages this stage requires data"""
+
+        self.deps_sem = [
+            mp.Semaphore(self.num_stages - i - 1)
+            for i in range(self.num_stages)]
+        """Dependency Semaphore signifiying that the resources is on hold"""
+
+        self.sync_barrier = mp.Barrier(self.num_stages)
+        """Semaphore for initialization synchronization"""
 
         self.step_sem = mp.Semaphore(0)
         """Semaphore signaling that .step() called. Used by the process 0"""
@@ -302,6 +315,13 @@ class PPRuntime:
         os.environ['MASTER_PORT'] = '29500'
         dist.init_process_group(
             backend='nccl', rank=rank, world_size=self.num_stages)
+        # Get the device uuid for this rank
+        gpu_uuids = torch.cuda._raw_device_uuid_nvml()
+        self.device_config[rank] = {
+            gpuIdx: gpu_uuids[gpuIdx]
+            for gpuIdx in self.device_config[rank]}
+        self.sync_barrier.wait()
+        print(self.device_config)
 
     def init_rank(self, rank):
         assert self.split_config is not None
@@ -369,95 +389,148 @@ class PPRuntime:
         # TODO: visualize
         draw_graph(self.model, f"logs/rank{rank}.dot")
 
+        # Wait for all paraticipants to finish initilization
+        self.sync_barrier.wait()
+
+    def _recv_data_shm(self, rank):
+        """Receive data with shared memory"""
+        return {
+            k: v for dep_stage in self.dep_stages
+            for k, v in self.prereq_data[rank][dep_stage].get().items()
+        }
+
+    def _recv_data_nccl(self, rank):
+        devices = self.device_config[rank]
+        # First receive metadata via shared queue to get corrent input tensor shape and device
+        data_desc = {
+            stage: dict(self.prereq_data[rank][stage].get().items())
+            for stage in sorted(self.dep_stages)
+        }
+        # then construct the tensors and receive true data via nccl
+        data = {}
+
+        for dep_stage in sorted(self.dep_stages):
+            for k, (tag, shape, dev) in data_desc[dep_stage].items():
+                if tag == 'T':
+                    device = torch.device(dev)
+                    if device.type == 'cpu' or (
+                            self.device_config[rank][device.index] ==
+                            self.device_config[dep_stage][device.index]):
+                        tensor = self.prereq_data[rank][dep_stage].get()
+                        data[k] = tensor.clone()
+                        del tensor
+                    else:
+                        data[k] = torch.empty(shape).to(device)
+                        dist.recv(data[k], dep_stage)
+                elif tag == 'L':
+                    data[k] = []
+                    for s, d in zip(shape, dev):
+                        device = torch.device(d)
+                        if device.type == 'cpu' or (
+                                self.device_config[rank][device.index] ==
+                                self.device_config[dep_stage][device.index]):
+                            tensor = self.prereq_data[rank][dep_stage].get()
+                            data[k].append(tensor.clone())
+                            del tensor
+                        else:
+                            data[k].append(torch.empty(s).to(device))
+                            dist.recv(data[k][-1], dep_stage)
+                else:
+                    raise RuntimeError("Unsupported data type")
+        return data
+
     def recv_data(self, rank):
         if self.backend == 'nccl':
-            devices = self.device_config[rank]
-            # First receive metadata via shared queue to get corrent input tensor shape and device
-            data_desc = {
-                stage: dict(self.prereq_data[rank][stage].get().items())
-                for stage in sorted(self.dep_stages)
-            }
-            # then construct the tensors and receive true data via nccl
-            data = dict()
-            print(data)
-            for dep_stage in sorted(self.dep_stages):
-                for k, (tag, shape) in data_desc[dep_stage].items():
-                    if tag == 'T':
-                        data[k] = torch.empty(shape).to(f"cuda:{devices[0]}")
-                        dist.recv(data[k], dep_stage)
-                    elif tag == 'L':
-                        data[k] = list(
-                            torch.empty(s).to(f"cuda:{devices[0]}")
-                            for s in shape)
-                        for i in range(len(shape)):
-                            dist.recv(data[k][i], dep_stage)
-                    else:
-                        raise RuntimeError("Unsupported data type")
-            return data
+            return self._recv_data_nccl(rank)
         else:
-            return {
-                k: v for dep_stage in self.dep_stages
-                for k, v in self.prereq_data[rank][dep_stage].get().items()
-            }
+            return self._recv_data_shm(rank)
+
+    def _send_data_shm(self, rank, output):
+        for send_stage, values in sorted(output.items()):
+            with torch.no_grad():
+                self.prereq_data[send_stage][rank].put(values)
+
+    def _send_data_nccl(self, rank, output):
+        for send_stage, values in sorted(output.items()):
+            data_desc = {}
+            send_list = []
+            # Compute metadata. We assume everything is (list of) tensor
+            for k, v in values.items():
+                if isinstance(v, torch.Tensor):
+                    desc = ('T', list(v.shape), str(v.device))
+                    data_desc[k] = desc
+                    send_list.append((v.device, v))
+                elif isinstance(v, list) or isinstance(v, tuple):
+                    assert all(isinstance(vv, torch.Tensor) for vv in v)
+                    data_desc[k] = (
+                        'L', [list(vv.shape) for vv in v],
+                        [str(vv.device) for vv in v])
+                    send_list.extend((vv.device, vv) for vv in v)
+                else:
+                    raise RuntimeError(f"Unsupported data type {v}")
+            # Send metadata first
+            with torch.no_grad():
+                self.prereq_data[send_stage][rank].put(data_desc)
+            # Then send all tensors
+            for device, tensor in send_list:
+                # This assumes that for the same tensor, send/recv device is
+                # the same. I.e. the mapping of intermediate tensors across
+                # all ranks are the same.
+                if device.type == 'cpu' or (
+                        self.device_config[rank][device.index] ==
+                        self.device_config[send_stage][device.index]):
+                    self.prereq_data[send_stage][rank].put(tensor)
+                else:
+                    dist.send(tensor, send_stage)
 
     def send_data(self, rank, output):
         if self.backend == 'nccl':
-            for send_stage, values in sorted(output.items()):
-                data_desc = {k: tuple() for k in values.keys()}
-                send_list = []
-                # Compute metadata. We assume everything is (tuple of) tensor
-                for k, v in values.items():
-                    if isinstance(v, torch.Tensor):
-                        data_desc[k] = ('T', list(v.shape))
-                        send_list.append(v)
-                    elif isinstance(v, list):
-                        assert all(isinstance(vv, torch.Tensor) for vv in v)
-                        data_desc[k] = ('L', [list(vv.shape) for vv in v])
-                        send_list.extend(vv for vv in v)
-                    else:
-                        raise RuntimeError(f"Unsupported data type {v}")
-                # Send metadata first
-                with torch.no_grad():
-                    self.prereq_data[send_stage][rank].put(data_desc)
-                # Then send all tensors
-                for tensor in send_list:
-                    dist.send(tensor, send_stage)
+            self._send_data_nccl(rank, output)
         else:
-            for send_stage, values in sorted(output.items()):
-                with torch.no_grad():
-                    self.prereq_data[send_stage][rank].put(values)
+            self._send_data_shm(rank, output)
+
+    def acquire_dependants(self, rank):
+        for stage in range(self.num_stages - rank - 1):
+            self.deps_sem[stage].acquire()
+
+    def release_dependencies(self, rank):
+        for stage in range(rank):
+            self.deps_sem[stage].release()
 
     def worker_loop(self, rank: int):
         """Each worker's own compute loop"""
         self.init_dist_backend(rank)
         self.init_rank(rank)
 
+        Zone = self.profile_cli.ScopedZone if self.profiled else nullcontext
+
         iteration = 0
         while True:
+            self.acquire_dependants(rank)
             # Obtain input
             if rank == 0:
                 print(f"Step sem value is {self.step_sem.get_value()}")
                 self.step_sem.acquire()
-                with self.profile_cli.ScopedZone("load-data") if self.profiled else nullcontext() as zone:
+                with Zone("load-data") as zone:
                     data = self.input_fn(iteration)
             else:
                 # get from dependent stages and combine datas
-                with self.profile_cli.ScopedZone("recv") if self.profiled else nullcontext() as zone:
+                with Zone("recv") as zone:
                     data = self.recv_data(rank)
+            self.release_dependencies(rank)
 
             # Process input
             with open(f"logs/{rank}.log", "a") as log:
                 log.write(f"r {rank} it {iteration}: data {data}\n")
-
             with torch.no_grad():
                 output = self.model(*data) if rank == 0 else self.model(**data)
 
             # Send/process output
             if rank != self.num_stages - 1:
-                with self.profile_cli.ScopedZone("send") if self.profiled else nullcontext() as zone:
+                with Zone("send") as zone:
                     self.send_data(rank, output)
             else:
-                with self.profile_cli.ScopedZone("process-output") if self.profiled else nullcontext() as zone:
+                with Zone("process-output") as zone:
                     self.output_fn(iteration, output)
 
             iteration += 1
@@ -471,6 +544,8 @@ class PPRuntime:
         self.step_sem.release()
 
     def join_all(self):
+        # TODO: need a lock signifying that later stages is using the previous
+        # stages's resources, holding it in place so that resources are available
         self.processes.join()
 
     @staticmethod

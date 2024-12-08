@@ -860,9 +860,9 @@ def inference_pp(
         input_fn(args, use_gpu, device, ndevices),
         output_fn(args),
         split_config=split_config,
-        backend='cpu'
-        # device_config=[[0]] * 6,
-        # backend='nccl' if args.use_gpu else 'cpu'
+        # backend='cpu'
+        device_config=[[0]] * 6,
+        backend='nccl' if args.use_gpu else 'cpu'
     )
 
     k = 0
